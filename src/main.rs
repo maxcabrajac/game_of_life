@@ -6,22 +6,6 @@ enum Cell {
 	Alive,
 }
 
-struct Config {
-	w: usize,
-	h: usize,
-	alive_probability: f64,
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Config {
-			w: 100,
-			h: 30,
-			alive_probability: 0.2,
-		}
-	}
-}
-
 mod array {
     use std::ops::{Index, IndexMut};
 
@@ -86,98 +70,157 @@ use array::Array2d;
 
 type Buff = Array2d<Cell>;
 
-fn empty_buff(cfg: &Config) -> Buff {
-	Buff::new(cfg.w, cfg.h, Cell::Dead)
-}
-
-fn random_buff(cfg: &Config) -> Buff {
+fn random_buff(w: usize, h: usize, alive_prob: f64) -> Buff {
 	use rand::prelude::*;
 
 	let mut rng = rand::thread_rng();
 	let mut random_state = || {
-		match rng.gen_bool(cfg.alive_probability) {
+		match rng.gen_bool(alive_prob) {
 			true => Cell::Alive,
 			false => Cell::Dead,
 		}
 	};
 
-	Buff::new_with(cfg.w, cfg.h, |_i, _j| random_state())
+	Buff::new_with(w, h, |_i, _j| random_state())
 }
 
-fn cell_evolution(buff: &Buff, i: usize, j: usize) -> Cell {
-	const NEIGHBORS_DIRS_X: [isize; 8] = [-1, 0, 1, -1, 1, -1, 0, 1];
-	const NEIGHBORS_DIRS_Y: [isize; 8] = [-1, -1, -1, 0, 0, 1, 1, 1];
+struct GameOfLife {
+	buffs: (Buff, Buff),
+	epoch_parity: bool,
+}
 
-	let neighbors_dirs  = NEIGHBORS_DIRS_X.iter().zip(NEIGHBORS_DIRS_Y.iter());
+impl GameOfLife {
+	fn cell_evolution(buff: &Buff, i: usize, j: usize) -> Cell {
+		const NEIGHBORS_DIRS_X: [isize; 8] = [-1, 0, 1, -1, 1, -1, 0, 1];
+		const NEIGHBORS_DIRS_Y: [isize; 8] = [-1, -1, -1, 0, 0, 1, 1, 1];
 
-	let (w, h) = buff.dims();
+		let neighbors_dirs  = NEIGHBORS_DIRS_X.iter().zip(NEIGHBORS_DIRS_Y.iter());
 
-	let neighbors = neighbors_dirs.map(|(dx, dy)| {
-		let move_wrapping = |x: usize, dx: isize, limit: usize| {
-			let mut x = x.checked_add_signed(dx).unwrap_or(limit - 1);
-			if x == limit {
-				x = 0
+		let (w, h) = buff.dims();
+
+		let neighbors = neighbors_dirs.map(|(dx, dy)| {
+			let move_wrapping = |x: usize, dx: isize, limit: usize| {
+				let mut x = x.checked_add_signed(dx).unwrap_or(limit - 1);
+				if x == limit {
+					x = 0
+				}
+				x
+			};
+			(move_wrapping(i, *dx, h), move_wrapping(j, *dy, w))
+		});
+
+		let neighbor_count: u8 = neighbors.map(|pos| {
+			match buff[pos] {
+				Cell::Alive => 1,
+				Cell::Dead => 0,
 			}
-			x
-		};
-		(move_wrapping(i, *dx, h), move_wrapping(j, *dy, w))
-	});
+		}).sum();
 
-	let neighbor_count: u8 = neighbors.map(|pos| {
-		match buff[pos] {
-			Cell::Alive => 1,
-			Cell::Dead => 0,
+		match buff[(i, j)] {
+			// Birth
+			Cell::Dead if neighbor_count == 3 => Cell::Alive,
+			// Death by isolation
+			Cell::Alive if neighbor_count < 2 => Cell::Dead,
+			// Death by overpopulation
+			Cell::Alive if neighbor_count > 3 => Cell::Dead,
+			// Stable
+			Cell::Alive => Cell::Alive,
+			Cell::Dead => Cell::Dead,
 		}
-	}).sum();
+	}
 
-	match buff[(i, j)] {
-		// Birth
-		Cell::Dead if neighbor_count == 3 => Cell::Alive,
-		// Death by isolation
-		Cell::Alive if neighbor_count < 2 => Cell::Dead,
-		// Death by overpopulation
-		Cell::Alive if neighbor_count > 3 => Cell::Dead,
-		// Stable
-		Cell::Alive => Cell::Alive,
-		Cell::Dead => Cell::Dead,
+	fn new(start: Buff) -> Self {
+		let (w, h) = start.dims();
+		let other = Buff::new(w, h, Cell::Dead);
+		Self {
+			buffs: (start, other),
+			epoch_parity: true,
+		}
+	}
+
+	fn update(&mut self) {
+		let (prev, next) = {
+			if self.epoch_parity {
+				(&self.buffs.0, &mut self.buffs.1)
+			} else {
+				(&self.buffs.1, &mut self.buffs.0)
+			}
+		};
+		self.epoch_parity = !self.epoch_parity;
+
+		let (w, h) = prev.dims();
+		for i in 0..h {
+			for j in 0..w {
+				next[(i, j)] = Self::cell_evolution(prev, i, j);
+			}
+		}
+	}
+
+	fn state(&self) -> &Buff {
+		if self.epoch_parity {
+			&self.buffs.0
+		} else {
+			&self.buffs.1
+		}
+	}
+}
+
+trait Renderer {
+	fn size(&self) -> (usize, usize);
+	fn render(&mut self, b: &Buff);
+}
+
+struct TerminalRenderer {
+	stdout: std::io::Stdout,
+}
+
+impl Default for TerminalRenderer {
+	fn default() -> Self {
+		Self {
+			stdout: std::io::stdout()
+		}
+	}
+}
+
+impl Renderer for TerminalRenderer {
+	fn size(&self) -> (usize, usize) {
+		let (w, h) = crossterm::terminal::size().unwrap();
+		(w.try_into().unwrap(), h.try_into().unwrap())
+	}
+
+	fn render(&mut self, b: &Buff) {
+		use crossterm::*;
+		let (w, h) = b.dims();
+
+		_ = self.stdout.queue(cursor::Hide);
+		for i in 0..h {
+			_= queue!(self.stdout, cursor::MoveTo(0, i.try_into().unwrap()));
+			for j in 0..w {
+				_ = queue!(self.stdout,
+					style::Print(if let Cell::Alive = b[(i, j)] { '█' } else { ' ' }),
+				);
+
+			}
+		}
+
+		_ = self.stdout.queue(cursor::Show);
+		self.stdout.flush().unwrap();
 	}
 }
 
 fn main() {
-	let cfg = Config::default();
-	let mut buffs = (random_buff(&cfg), empty_buff(&cfg));
+	const ALIVE_PROB: f64 = 0.2;
 
-	let mut epoch = 0;
-	let mut stdout = std::io::stdout();
+	let mut renderer = TerminalRenderer::default();
+	let (w, h) = renderer.size();
+	let mut gol = GameOfLife::new(random_buff(w, h, ALIVE_PROB));
 
 	loop {
+		gol.update();
 
-		// padding
-		for _ in 0..5 {
-			_ = write!(stdout, "\n");
-		}
+		let b = gol.state();
+		renderer.render(b);
 
-		let (prev, next) = {
-			if epoch % 2 == 0 {
-				(&buffs.0, &mut buffs.1)
-			} else {
-				(&buffs.1, &mut buffs.0)
-			}
-		};
-		epoch += 1;
-
-		let (w, h) = (cfg.w, cfg.h);
-		for i in 0..h {
-			for j in 0..w {
-				next[(i, j)] = cell_evolution(prev, i, j);
-				_ = write!(stdout, "{}", if let Cell::Alive = prev[(i, j)] { 'o' } else { ' ' });
-			}
-			_ = write!(stdout, "\n");
-		}
-
-		stdout.flush().unwrap();
-		sleep(Duration::from_millis(500));
-
+		sleep(Duration::from_millis(50));
 	}
-
 }
