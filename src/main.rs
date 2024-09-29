@@ -1,4 +1,5 @@
 use std::{io::Write, thread::sleep, time::Duration};
+use clap::Parser;
 
 #[derive(Clone, Copy, Debug)]
 enum Cell {
@@ -54,6 +55,7 @@ mod array {
 	}
 
 	impl<T: Default> Array2d<T> {
+		#[allow(unused)]
 		pub fn new_default(w: usize, h: usize) -> Self {
 			Self::new_with(w, h, |_, _| T::default())
 		}
@@ -172,34 +174,99 @@ trait Renderer {
 
 struct TerminalRenderer {
 	stdout: std::io::Stdout,
+	braille: bool
+}
+
+impl TerminalRenderer {
+	fn new(braille: bool) -> Self {
+		Self {
+			stdout: std::io::stdout(),
+			braille,
+		}
+	}
+
+	fn char_size(&self) -> (usize, usize) {
+		if self.braille {
+			(2, 4)
+		} else {
+			(1, 1)
+		}
+	}
+
+	fn screen_size(&self) -> (usize, usize) {
+		let (w, h) = crossterm::terminal::size().unwrap();
+		(w.into(), h.into())
+	}
+
+	fn decide_char(&self, b: &Buff, i: usize, j: usize) -> char {
+		if !self.braille {
+			return if let Cell::Alive = b[(i, j)] {
+				'█'
+			} else {
+				' '
+			}
+		}
+
+		// 1 4
+		// 2 5
+		// 3 6
+		// 7 8
+		let positions = [
+			(0, 0),
+			(1, 0),
+			(2, 0),
+			(0, 1),
+			(1, 1),
+			(2, 1),
+			(3, 0),
+			(3, 1),
+		];
+
+		assert!(positions.len() == 8);
+
+		let braille_number = positions
+			.into_iter()
+			.map(|(di, dj)| b[(i + di, j + dj)])
+			.rev()
+			.fold(0, |acc, cell| {
+				(acc << 1) | match cell {
+					Cell::Alive => 1,
+					Cell::Dead => 0,
+				}
+			});
+
+		let braille_base = 0x2800;
+
+		char::from_u32(braille_base + braille_number).unwrap()
+	}
 }
 
 impl Default for TerminalRenderer {
 	fn default() -> Self {
-		Self {
-			stdout: std::io::stdout()
-		}
+		Self::new(false)
 	}
 }
 
 impl Renderer for TerminalRenderer {
 	fn size(&self) -> (usize, usize) {
-		let (w, h) = crossterm::terminal::size().unwrap();
-		(w.try_into().unwrap(), h.try_into().unwrap())
+		let (w, h) = self.screen_size();
+		let (ws, hs) = self.char_size();
+		(w * ws, h * hs)
 	}
 
 	fn render(&mut self, b: &Buff) {
 		use crossterm::*;
-		let (w, h) = b.dims();
+		let (w, h) = self.screen_size();
+		let (ws, hs) = self.char_size();
 
 		_ = self.stdout.queue(cursor::Hide);
-		for i in 0..h {
-			_= queue!(self.stdout, cursor::MoveTo(0, i.try_into().unwrap()));
-			for j in 0..w {
+		for (line, i) in (0..h).map(|x| (x, x * hs)) {
+			_= queue!(self.stdout, cursor::MoveTo(0, line.try_into().unwrap()));
+			for j in (0..w).map(|x| x * ws) {
+				let char = self.decide_char(b, i, j);
 				_ = queue!(self.stdout,
-					style::Print(if let Cell::Alive = b[(i, j)] { '█' } else { ' ' }),
+					style::Print(char),
 				);
-
 			}
 		}
 
@@ -208,12 +275,26 @@ impl Renderer for TerminalRenderer {
 	}
 }
 
-fn main() {
-	const ALIVE_PROB: f64 = 0.2;
+#[derive(Parser, Debug)]
+struct CLIArgs {
+	#[arg(short, long, help="Wheather use block instead of braille")]
+	block: bool,
 
-	let mut renderer = TerminalRenderer::default();
+	#[arg(short, long, help="Chance of a starting alive cell", default_value_t = 0.2)]
+	probability: f64,
+}
+
+
+fn main() {
+	let args = CLIArgs::parse();
+	assert!(args.probability >= 0.);
+	assert!(args.probability <= 1.);
+
+	let braille = !args.block;
+
+	let mut renderer = TerminalRenderer::new(braille);
 	let (w, h) = renderer.size();
-	let mut gol = GameOfLife::new(random_buff(w, h, ALIVE_PROB));
+	let mut gol = GameOfLife::new(random_buff(w, h, args.probability));
 
 	loop {
 		gol.update();
