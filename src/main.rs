@@ -1,4 +1,4 @@
-use std::{io::Write, thread::sleep, time::Duration};
+use std::{io::Write, sync::mpsc::{channel, TryRecvError}, thread::sleep, time::Duration};
 use clap::Parser;
 
 #[derive(Clone, Copy, Debug)]
@@ -290,6 +290,10 @@ fn main() {
 	assert!(args.probability >= 0.);
 	assert!(args.probability <= 1.);
 
+	let (tx, rx) = channel();
+
+	ctrlc::set_handler(move || tx.send(()).unwrap()).unwrap();
+
 	let braille = !args.block;
 
 	let mut renderer = TerminalRenderer::new(braille);
@@ -303,5 +307,9 @@ fn main() {
 		renderer.render(b);
 
 		sleep(Duration::from_millis(50));
+		match rx.try_recv() {
+			Err(TryRecvError::Empty) => {}
+			_ => break,
+		}
 	}
 }
